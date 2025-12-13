@@ -4,30 +4,28 @@ import queue
 import subprocess
 import random
 import sys
-import time # Added missing import
+import time
+import os
+
+# --- CRITICAL FIX: Ensure modules are found ---
+current_dir = os.path.dirname(os.path.abspath(__file__))
+if current_dir not in sys.path:
+    sys.path.insert(0, current_dir)
 
 # Import custom modules
 try:
     from data_structures import BlacklistBST, AlertStack, NetworkGraph
     from core_modules import PacketCaptureThread, DetectionEngine, FirewallManager, Logger
 except ImportError as e:
-    # If standard import fails, try relative import if running as a package
-    # or just print error
-    print(f"Import Error: {e}")
-    print("Ensure 'data_structures.py' and 'core_modules.py' are in the same directory as 'main.py'.")
-    # For some IDEs/environments, current dir might not be in path
-    sys.path.append(".")
-    try:
-        from data_structures import BlacklistBST, AlertStack, NetworkGraph
-        from core_modules import PacketCaptureThread, DetectionEngine, FirewallManager, Logger
-    except ImportError as e2:
-        print(f"Retry Import Error: {e2}")
-        sys.exit(1)
+    print(f"CRITICAL IMPORT ERROR: {e}")
+    sys.exit(1)
 
 # Check for Scapy
 try:
     import scapy.all
 except ImportError:
+    root = tk.Tk()
+    root.withdraw()
     messagebox.showerror("Missing Dependency", "Scapy is not installed.\nPlease run: pip install scapy")
     sys.exit(1)
 
@@ -46,10 +44,11 @@ class HipsDashboard:
         self.alert_stack = AlertStack()
         self.network_graph = NetworkGraph()
         
-        # [Lab 7] Queue Implementation: Created here and passed to threads
+        # [Lab 7] Queue Implementation
         self.packet_queue = queue.Queue()
         
         self.populate_dummy_blacklist()
+        self.captured_packets_data = [] 
 
         # Styles
         style = ttk.Style()
@@ -66,7 +65,6 @@ class HipsDashboard:
         self.btn_stop = ttk.Button(control_frame, text="Stop System", command=self.stop_system, state="disabled")
         self.btn_stop.pack(side="left", padx=5)
 
-        # [Lab 11] Sorting Button
         self.btn_sort = ttk.Button(control_frame, text="Sort Traffic (Bubble Sort)", command=self.sort_traffic)
         self.btn_sort.pack(side="left", padx=5)
 
@@ -109,8 +107,7 @@ class HipsDashboard:
         self.sniffer = None
         self.detector = None
         self.is_running = False
-        self.captured_packets_data = [] 
-
+        
         self.center_x, self.center_y = 200, 175
         self.draw_node("LocalHost", self.center_x, self.center_y, "blue")
 
@@ -119,20 +116,14 @@ class HipsDashboard:
         for ip in threats:
             self.blacklist_bst.insert(ip)
 
-    # --- [Lab 11] Bubble Sort Implementation ---
     def sort_traffic(self):
-        """Sorts the traffic table by packet size."""
         data = self.captured_packets_data
         n = len(data)
         if n < 2: return
-
-        # Bubble Sort
         for i in range(n):
             for j in range(0, n-i-1):
-                if data[j][4] < data[j+1][4]: # Sort Descending
+                if data[j][4] < data[j+1][4]: 
                     data[j], data[j+1] = data[j+1], data[j]
-        
-        # Update UI
         self.tree.delete(*self.tree.get_children())
         for row in data:
             self.tree.insert("", "end", values=row)
@@ -176,7 +167,6 @@ class HipsDashboard:
         sim_host = "Attacker (Russia)"
         sim_reason = "Signature Match: SQL Injection (Simulation)"
         sim_severity = "High"
-        
         self.update_gui("ALERT", (sim_ip, sim_host, sim_reason, sim_severity))
         Logger.log_alert(sim_ip, sim_reason, sim_severity)
         messagebox.showinfo("Simulation", "Simulated Attack Injected!")
@@ -188,11 +178,9 @@ class HipsDashboard:
             return
         msg = self.alert_list.get(selection[0])
         try:
-            # Format: "[SEVERITY] BLOCKED IP (Host): Reason"
-            # Split by spaces. IP is typically the 3rd word.
             parts = msg.split()
-            # Example: ["[HIGH]", "BLOCKED", "1.2.3.4", ...]
-            ip_to_unblock = parts[2]
+            # Assuming format: [HIGH] BLOCKED 1.2.3.4 ...
+            ip_to_unblock = parts[2] 
             
             if FirewallManager.unblock_ip(ip_to_unblock):
                 if self.detector and ip_to_unblock in self.detector.blocked_ips:
@@ -202,7 +190,9 @@ class HipsDashboard:
         except Exception as e:
             messagebox.showerror("Error", f"Could not unblock: {e}")
 
+    # --- Thread-Safe GUI Update ---
     def update_gui(self, type, data):
+        # We use 'after' to schedule the update on the main thread
         self.root.after(0, lambda: self._process_gui_update(type, data))
 
     def _process_gui_update(self, type, data):
@@ -229,12 +219,15 @@ class HipsDashboard:
                 self.draw_edge("LocalHost", node_key)
             
         elif type == "ALERT":
+            # Unpack the 4 items sent by detection engine
             src, hostname, reason, severity = data
-            # Format: [SEVERITY] BLOCKED IP (Host) : Reason
+            
             msg = f"[{severity.upper()}] BLOCKED {src} ({hostname}) : {reason}"
             
+            # Insert at the top (index 0) so newest alerts are first
             self.alert_list.insert(0, msg)
             
+            # Turn node RED
             if hostname in self.nodes_drawn:
                 x, y = self.nodes_drawn[hostname]
                 self.draw_node(hostname, x, y, "red")
@@ -249,10 +242,8 @@ class HipsDashboard:
         self.btn_stop.config(state="normal")
         self.lbl_status.config(text="Status: SYSTEM ACTIVE - Logging to file", foreground="green")
 
-        # Create sniffer and pass queue
         self.sniffer = PacketCaptureThread(self.packet_queue)
         
-        # Create detector and pass queue + other structures
         self.detector = DetectionEngine(
             self.packet_queue, 
             self.update_gui, 

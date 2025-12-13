@@ -5,7 +5,7 @@ import socket
 import datetime
 import sys
 
-# Handle Scapy import
+# Handle Scapy import gracefully
 try:
     from scapy.all import sniff, IP, TCP, UDP, ARP, Raw
 except ImportError:
@@ -158,19 +158,23 @@ class DetectionEngine(threading.Thread):
                 print(f"[DETECTION ERROR] {e}")
 
     def analyze(self, pkt):
-        # Feature 6: ARP Spoofing Prevention
+        # Feature 6: ARP Spoofing Prevention (Moved BEFORE IP filtering)
         if ARP in pkt:
+            # op=2 means 'is-at' (ARP Reply)
             if pkt[ARP].op == 2:
                 ip_src = pkt[ARP].psrc
                 mac_src = pkt[ARP].hwsrc
                 
+                # Check if we have seen this IP before
                 if ip_src in self.arp_table:
+                    # If the MAC address has changed for the same IP, it's spoofing!
                     if self.arp_table[ip_src] != mac_src:
-                        self.trigger_alert(ip_src, "ARP Spoofing Detected", "High")
+                        self.trigger_alert(ip_src, "ARP Spoofing Detected (MAC Change)", "High")
                         return
                 
+                # Update table with current mapping
                 self.arp_table[ip_src] = mac_src
-            return 
+            return # Done with ARP
 
         if IP not in pkt:
             return
@@ -190,7 +194,8 @@ class DetectionEngine(threading.Thread):
             sport = pkt[UDP].sport
             dport = pkt[UDP].dport
 
-        # Filter local traffic
+        # Filter local traffic visualization (This stops us from seeing non-local traffic in GUI)
+        # BUT we already processed ARP above, so we don't miss spoofing.
         if src_ip != self.local_ip and dst_ip != self.local_ip:
             return
             
