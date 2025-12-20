@@ -7,6 +7,8 @@ import sys
 import time
 import os
 import socket
+import json
+import csv
 try:
     import psutil
 except Exception:
@@ -86,9 +88,15 @@ class HipsDashboard:
         
         self.btn_manage_blocks = ttk.Button(control_frame, text="Manage Blocks", command=self.manage_blocks)
         self.btn_manage_blocks.pack(side="right", padx=5)
+        
+        self.btn_export_stats = ttk.Button(control_frame, text="Export Stats", command=self.export_stats)
+        self.btn_export_stats.pack(side="right", padx=5)
 
         self.lbl_status = ttk.Label(control_frame, text="Status: Ready (Check 'hips_alerts.log' for history)", foreground="blue")
         self.lbl_status.pack(side="left", padx=20)
+        
+        self.lbl_stats = ttk.Label(control_frame, text="[Stats: -- ]", foreground="darkgreen")
+        self.lbl_stats.pack(side="left", padx=10)
 
         mid_frame = tk.Frame(root)
         mid_frame.pack(fill="both", expand=True, padx=10, pady=5)
@@ -193,6 +201,37 @@ class HipsDashboard:
         threats = ["192.168.1.100", "10.0.0.5", "172.16.0.25"]
         for ip in threats:
             self.blacklist_bst.insert(ip)
+
+    def export_stats(self):
+        """Export metrics to JSON and CSV files."""
+        if not self.detector:
+            messagebox.showwarning("Export Stats", "System not started yet.")
+            return
+        
+        from datetime import datetime
+        
+        metrics = self.detector.metrics.copy()
+        uptime = time.time() - metrics.get('start_time', time.time())
+        metrics['uptime_seconds'] = uptime
+        metrics['start_time'] = datetime.fromtimestamp(metrics['start_time']).isoformat()
+        
+        try:
+            # Export JSON
+            json_file = "hips_stats.json"
+            with open(json_file, 'w') as f:
+                json.dump(metrics, f, indent=2)
+            
+            # Export CSV
+            csv_file = "hips_stats.csv"
+            with open(csv_file, 'w', newline='') as f:
+                w = csv.writer(f)
+                w.writerow(["Metric", "Value"])
+                for k, v in metrics.items():
+                    w.writerow([k, v])
+            
+            messagebox.showinfo("Export Stats", f"Exported to {json_file} and {csv_file}")
+        except Exception as e:
+            messagebox.showerror("Export Error", str(e))
 
     def sort_traffic(self):
         data = self.captured_packets_data
@@ -299,9 +338,19 @@ class HipsDashboard:
         sim_host = self.get_random_host()
         sim_reason = self.get_random_reason()
         sim_severity = self.get_random_severity()
+        # Show simulated alert in GUI and log it
         self.update_gui("ALERT", (sim_ip, sim_host, sim_reason, sim_severity))
         Logger.log_alert(sim_ip, sim_reason, sim_severity)
         messagebox.showinfo("Simulation", f"Simulated Attack Injected!\nIP: {sim_ip}\nSeverity: {sim_severity}")
+
+        # Ensure the simulated IP is actually blocked by the detection engine
+        try:
+            if self.detector:
+                # Use the same alert path as real detections
+                self.detector.trigger_alert(sim_ip, sim_reason, sim_severity)
+        except Exception as e:
+            # Log any error but don't crash the GUI
+            print(f"[SIMULATE] Failed to trigger alert for {sim_ip}: {e}")
 
     def unblock_selected_ip(self):
         selection = self.alert_list.curselection()
@@ -310,12 +359,19 @@ class HipsDashboard:
             return
         msg = self.alert_list.get(selection[0])
         try:
-            parts = msg.split()
-            # Assuming format: [HIGH] BLOCKED 1.2.3.4 ...
-            ip_to_unblock = parts[2] 
-            
-            if FirewallManager.unblock_ip(ip_to_unblock):
-                if self.detector:
+            import re
+            # Try to extract an IP (IPv4 or IPv6) after the word BLOCKED
+            m = re.search(r"BLOCKED\s+([^\s(]+)", msg)
+            if not m:
+                # Fallback: split and take the 3rd token
+                parts = msg.split()
+                ip_to_unblock = parts[2]
+            else:
+                ip_to_unblock = m.group(1)
+
+            # First, remove from in-memory blocked set and persist so UI reflects unblocked state
+            if self.detector:
+                try:
                     with self.detector.blocked_lock:
                         if ip_to_unblock in self.detector.blocked_ips:
                             self.detector.blocked_ips.remove(ip_to_unblock)
@@ -323,8 +379,19 @@ class HipsDashboard:
                         self.detector._save_persisted_blocks()
                     except Exception:
                         pass
+                except Exception as e:
+                    print(f"[UNBLOCK] Error removing from in-memory set: {e}")
+
+            # Then attempt OS-level unblock; if it fails, inform the user but UI state is already updated
+            if FirewallManager.unblock_ip(ip_to_unblock):
                 messagebox.showinfo("Success", f"IP {ip_to_unblock} has been unblocked.")
+            else:
+                messagebox.showwarning("Partial Success", f"IP {ip_to_unblock} removed from application blocklist, but OS firewall rule may require admin rights to remove.")
+            # Remove alert from list UI
+            try:
                 self.alert_list.delete(selection[0])
+            except Exception:
+                pass
         except Exception as e:
             messagebox.showerror("Error", f"Could not unblock: {e}")
 
@@ -465,6 +532,9 @@ class HipsDashboard:
         # Start detector first so it is ready to consume packets.
         self.detector.start()
         self.sniffer.start()
+        
+        # Start periodic stats update
+        self.update_stats_display()
 
     def toggle_analyze_local(self):
         # Update detector setting if running; otherwise the value is used when starting.
@@ -489,6 +559,17 @@ class HipsDashboard:
             "Do not enable this option on multi-user systems or when handling sensitive data."
         )
         messagebox.showinfo("Privacy Info", message)
+    
+    def update_stats_display(self):
+        """Update the stats label periodically."""
+        if self.detector and self.is_running:
+            m = self.detector.metrics
+            stats_text = (f"[Stats: {m['packets_processed']} pkts | "
+                         f"{m['alerts_triggered']} alerts | "
+                         f"{m['ips_blocked']} blocked IPs | "
+                         f"{m['ipv6_blocked']} IPv6]")
+            self.lbl_stats.config(text=stats_text)
+        self.root.after(1000, self.update_stats_display)
 
     def stop_system(self):
         if not self.is_running: return
@@ -525,8 +606,9 @@ class HipsDashboard:
                 messagebox.showwarning("Unblock", "Select an IP first.")
                 return
             ip = lb.get(sel[0])
-            ok = FirewallManager.unblock_ip(ip)
-            if ok:
+            ok, msg = FirewallManager.unblock_ip(ip)
+            # Regardless of OS-level success, ensure application-level state is consistent
+            try:
                 with self.detector.blocked_lock:
                     if ip in self.detector.blocked_ips:
                         self.detector.blocked_ips.remove(ip)
@@ -534,17 +616,20 @@ class HipsDashboard:
                     self.detector._save_persisted_blocks()
                 except Exception:
                     pass
-                refresh_list()
-                # Remove alert entries that mention this IP
-                for i in range(self.alert_list.size()-1, -1, -1):
-                    try:
-                        if ip in self.alert_list.get(i):
-                            self.alert_list.delete(i)
-                    except Exception:
-                        pass
+            except Exception as e:
+                print(f"[UNBLOCK] Error updating in-memory blocks: {e}")
+            refresh_list()
+            # Remove alert entries that mention this IP
+            for i in range(self.alert_list.size()-1, -1, -1):
+                try:
+                    if ip in self.alert_list.get(i):
+                        self.alert_list.delete(i)
+                except Exception:
+                    pass
+            if ok:
                 messagebox.showinfo("Unblock", f"IP {ip} unblocked.")
             else:
-                messagebox.showerror("Unblock", f"Failed to unblock {ip}. Run as Administrator.")
+                messagebox.showwarning("Unblock", f"IP {ip} removed from app blocklist, but OS unblock failed: {msg}\nRun the app as Administrator to remove OS firewall rule.")
 
         btn_frame = tk.Frame(win)
         btn_frame.pack(fill='x', padx=8, pady=(0,8))
