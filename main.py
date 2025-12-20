@@ -6,6 +6,11 @@ import random
 import sys
 import time
 import os
+import socket
+try:
+    import psutil
+except Exception:
+    psutil = None
 
 # --- CRITICAL FIX: Ensure modules are found ---
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -36,7 +41,7 @@ except ImportError:
 class HipsDashboard:
     def __init__(self, root):
         self.root = root
-        self.root.title("HIPS - Intrusion Prevention System (Data Structures Project)")
+        self.root.title("HIPS - Intrusion Prevention System (Data Structures and Algorithm Project)")
         self.root.geometry("1100x750")
         
         # Initialize Labs Logic
@@ -71,6 +76,17 @@ class HipsDashboard:
         self.btn_sim = ttk.Button(control_frame, text="Simulate Attack", command=self.simulate_attack)
         self.btn_sim.pack(side="right", padx=5)
 
+        # Toggle to analyze local outgoing/incoming traffic (e.g., browser)
+        self.analyze_local_var = tk.BooleanVar(value=False)
+        self.chk_analyze_local = ttk.Checkbutton(control_frame, text="Analyze Local Traffic", variable=self.analyze_local_var, command=self.toggle_analyze_local)
+        self.chk_analyze_local.pack(side="right", padx=5)
+
+        self.btn_privacy = ttk.Button(control_frame, text="Privacy Info", command=self.show_privacy_info)
+        self.btn_privacy.pack(side="right", padx=5)
+        
+        self.btn_manage_blocks = ttk.Button(control_frame, text="Manage Blocks", command=self.manage_blocks)
+        self.btn_manage_blocks.pack(side="right", padx=5)
+
         self.lbl_status = ttk.Label(control_frame, text="Status: Ready (Check 'hips_alerts.log' for history)", foreground="blue")
         self.lbl_status.pack(side="left", padx=20)
 
@@ -80,12 +96,18 @@ class HipsDashboard:
         traffic_frame = ttk.LabelFrame(mid_frame, text="Live Traffic (Queue Buffer)", padding=5)
         traffic_frame.pack(side="left", fill="both", expand=True)
 
-        columns = ("Time", "Source", "Destination", "Protocol", "Size")
+        columns = ("Time", "Source", "Source IP", "Destination", "Dest Name", "S.Port", "D.Port", "Protocol", "Size", "PID/Proc")
         self.tree = ttk.Treeview(traffic_frame, columns=columns, show="headings", height=15)
         for col in columns:
             self.tree.heading(col, text=col)
-            width = 150 if col == "Source" else 90
-            self.tree.column(col, width=width)
+            if col == "Source":
+                self.tree.column(col, width=180)
+            elif col == "Source IP" or col == "Destination" or col == "Dest Name":
+                self.tree.column(col, width=130)
+            elif col in ("S.Port", "D.Port", "Protocol", "Size"):
+                self.tree.column(col, width=60, anchor='center')
+            else:
+                self.tree.column(col, width=100)
         self.tree.pack(fill="both", expand=True)
 
         map_frame = ttk.LabelFrame(mid_frame, text="Network Map (Graph)", padding=5)
@@ -101,8 +123,15 @@ class HipsDashboard:
         self.alert_list = tk.Listbox(alert_frame, height=6, fg="red", font=('Consolas', 10, 'bold'))
         self.alert_list.pack(side="left", fill="x", expand=True, padx=(0, 10))
         
+        # Listbox to show local traffic activity when analysis is enabled
+        self.activity_list = tk.Listbox(alert_frame, height=6, fg="black", font=('Consolas', 9))
+        self.activity_list.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        
         self.btn_unblock = ttk.Button(alert_frame, text="Unblock IP", command=self.unblock_selected_ip)
         self.btn_unblock.pack(side="right", padx=5)
+
+        self.btn_clear_activity = ttk.Button(alert_frame, text="Clear Activity", command=self.clear_activity)
+        self.btn_clear_activity.pack(side="right", padx=5)
 
         self.sniffer = None
         self.detector = None
@@ -110,6 +139,55 @@ class HipsDashboard:
         
         self.center_x, self.center_y = 200, 175
         self.draw_node("LocalHost", self.center_x, self.center_y, "blue")
+
+    def get_process_for_connection(self, local_side_is_self, local_ip, remote_ip, remote_port):
+        """Try to map a connection to a PID/process name using psutil (best-effort)."""
+        if not psutil:
+            return "(psutil missing)"
+        try:
+            conns = psutil.net_connections()
+            for c in conns:
+                r = c.raddr
+                if not r:
+                    continue
+                try:
+                    raddr = r.ip
+                    rport = r.port
+                except Exception:
+                    continue
+                if raddr == remote_ip and rport == remote_port:
+                    try:
+                        p = psutil.Process(c.pid)
+                        return f"{c.pid}/{p.name()}"
+                    except Exception:
+                        return f"{c.pid}"
+        except Exception:
+            return "(lookup-failed)"
+        return ""
+
+    def resolve_local_device(self, ip):
+        """Resolve a LAN device name for a local IP: try reverse DNS then arp table."""
+        try:
+            name = None
+            try:
+                name = socket.gethostbyaddr(ip)[0]
+            except Exception:
+                name = None
+            if name:
+                return name
+            # Fallback: parse `arp -a`
+            try:
+                out = subprocess.check_output(["arp", "-a"], universal_newlines=True)
+                for line in out.splitlines():
+                    if ip in line:
+                        parts = line.split()
+                        if len(parts) >= 2:
+                            return parts[1]
+            except Exception:
+                pass
+        except Exception:
+            pass
+        return ip
 
     def populate_dummy_blacklist(self):
         threats = ["192.168.1.100", "10.0.0.5", "172.16.0.25"]
@@ -122,7 +200,8 @@ class HipsDashboard:
         if n < 2: return
         for i in range(n):
             for j in range(0, n-i-1):
-                if data[j][4] < data[j+1][4]: 
+                # Column 8 is Size/Length in our row_data
+                if data[j][8] < data[j+1][8]: 
                     data[j], data[j+1] = data[j+1], data[j]
         self.tree.delete(*self.tree.get_children())
         for row in data:
@@ -162,14 +241,67 @@ class HipsDashboard:
             if not overlap: return rx, ry
         return random.randint(40, width - 40), random.randint(40, height - 40)
     
+    def generate_random_ip(self):
+        """Generate a random IP address from worldwide ranges"""
+        return f"{random.randint(1, 255)}.{random.randint(0, 255)}.{random.randint(0, 255)}.{random.randint(0, 255)}"
+
+    def get_random_host(self):
+        """Get random hostname/host"""
+        hosts = [
+            "Attacker (industrialhacker.com)",
+            "Unknown (suspicious-ip.net)",
+            "Botnet Node (malware-c2.ru)",
+            "Compromised Server (hacked-site.org)",
+            "Proxy (anonymizing-vpn.xyz)",
+            "Spoofed Host (fake-domain.com)",
+            "Zombie PC (infected-machine.ir)",
+            "Attacker (darknet-actor.onion)"
+        ]
+        return random.choice(hosts)
+
+    def get_random_reason(self):
+        """Get random attack reason"""
+        reasons = [
+            "Signature Match: SQL Injection (Simulation)",
+            "Anomaly Detected: Port Scanning Activity",
+            "Threat Intel: Known Malicious IP",
+            "Behavior Analysis: Brute Force Attempt",
+            "Signature Match: XSS Attack Vector",
+            "Policy Violation: Unauthorized Access",
+            "Signature Match: DDoS Attack Pattern",
+            "Anomaly: Unusual Traffic Volume",
+            "Signature Match: Ransomware Signature",
+            "Threat Alert: Known C&C Communication"
+        ]
+        return random.choice(reasons)
+
+    def get_random_severity(self):
+        """Get random severity level"""
+        severities = ["Low", "Medium", "High", "Critical"]
+        return random.choice(severities)
+
     def simulate_attack(self):
-        sim_ip = "45.155.205.10"
-        sim_host = "Attacker (Russia)"
-        sim_reason = "Signature Match: SQL Injection (Simulation)"
-        sim_severity = "High"
+        # Generate random IP that is NOT already blocked
+        sim_ip = self.generate_random_ip()
+        attempts = 0
+        while self.detector and attempts < 50:
+            blocked = False
+            try:
+                with self.detector.blocked_lock:
+                    blocked = (sim_ip in self.detector.blocked_ips)
+            except Exception:
+                blocked = (sim_ip in getattr(self.detector, 'blocked_ips', set()))
+            if not blocked:
+                break
+            sim_ip = self.generate_random_ip()
+            attempts += 1
+        
+        sim_host = self.get_random_host()
+        sim_reason = self.get_random_reason()
+        sim_severity = self.get_random_severity()
         self.update_gui("ALERT", (sim_ip, sim_host, sim_reason, sim_severity))
         Logger.log_alert(sim_ip, sim_reason, sim_severity)
-        messagebox.showinfo("Simulation", "Simulated Attack Injected!")
+        messagebox.showinfo("Simulation", f"Simulated Attack Injected!\nIP: {sim_ip}\nSeverity: {sim_severity}")
 
     def unblock_selected_ip(self):
         selection = self.alert_list.curselection()
@@ -183,8 +315,14 @@ class HipsDashboard:
             ip_to_unblock = parts[2] 
             
             if FirewallManager.unblock_ip(ip_to_unblock):
-                if self.detector and ip_to_unblock in self.detector.blocked_ips:
-                    self.detector.blocked_ips.remove(ip_to_unblock)
+                if self.detector:
+                    with self.detector.blocked_lock:
+                        if ip_to_unblock in self.detector.blocked_ips:
+                            self.detector.blocked_ips.remove(ip_to_unblock)
+                    try:
+                        self.detector._save_persisted_blocks()
+                    except Exception:
+                        pass
                 messagebox.showinfo("Success", f"IP {ip_to_unblock} has been unblocked.")
                 self.alert_list.delete(selection[0])
         except Exception as e:
@@ -201,11 +339,34 @@ class HipsDashboard:
         timestamp = time.strftime("%H:%M:%S")
 
         if type == "TRAFFIC":
-            src_ip, src_host, dst, proto, length = data
-            
-            row_data = (timestamp, src_host, dst, proto, length)
+            # data: (src_ip, src_host, dst_ip, proto, length, sport, dport)
+            src_ip, src_host, dst, proto, length, sport, dport = data
+
+            # Show friendly host and IP together
+            display_source = f"{src_host} ({src_ip})"
+            # Resolve local device names for local destinations
+            local_ip = getattr(self.detector, 'local_ip', None)
+            dst_display = dst
+            try:
+                if local_ip and dst == local_ip:
+                    dst_display = self.resolve_local_device(dst)
+            except Exception:
+                dst_display = dst
+
+            # Try to map to PID/process (best-effort)
+            pidinfo = ""
+            try:
+                if local_ip:
+                    if src_ip == local_ip:
+                        pidinfo = self.get_process_for_connection(True, local_ip, dst, int(dport) if dport else 0)
+                    elif dst == local_ip:
+                        pidinfo = self.get_process_for_connection(False, local_ip, src_ip, int(sport) if sport else 0)
+            except Exception:
+                pidinfo = ""
+
+            row_data = (timestamp, display_source, src_ip, dst, dst_display, sport, dport, proto, length, pidinfo)
             self.captured_packets_data.append(row_data)
-            
+
             self.tree.insert("", 0, values=row_data)
             if len(self.tree.get_children()) > 50:
                 self.tree.delete(self.tree.get_children()[-1])
@@ -235,6 +396,51 @@ class HipsDashboard:
                 x, y = self.nodes_drawn[src]
                 self.draw_node(src, x, y, "red")
 
+        elif type == 'LOCAL_ACTIVITY':
+            # data: (direction, src_ip, dst_ip, snippet)
+            direction, src_ip, dst_ip, snippet = data
+            ts = time.strftime("%H:%M:%S")
+            entry = f"{ts} [{direction}] {src_ip} -> {dst_ip} : {snippet}"
+            self.activity_list.insert(0, entry)
+            if self.activity_list.size() > 200:
+                self.activity_list.delete(tk.END)
+
+    def clear_activity(self):
+        # Clear activity listbox
+        try:
+            self.activity_list.delete(0, tk.END)
+        except Exception:
+            pass
+
+        # Remove local-related rows from traffic view and captured_packets_data
+        try:
+            removed = []
+            for iid in list(self.tree.get_children()):
+                vals = self.tree.item(iid, 'values')
+                # values layout: (Time, Source, Source IP, Destination, S.Port, D.Port, Protocol, Size, PID/Proc)
+                try:
+                    src_ip = vals[2]
+                    dst = vals[3]
+                except Exception:
+                    continue
+                if src_ip == getattr(self.detector, 'local_ip', None) or dst == getattr(self.detector, 'local_ip', None):
+                    removed.append(iid)
+            for iid in removed:
+                try:
+                    self.tree.delete(iid)
+                except Exception:
+                    pass
+
+            # Filter captured_packets_data
+            try:
+                local = getattr(self.detector, 'local_ip', None)
+                if local:
+                    self.captured_packets_data = [r for r in self.captured_packets_data if not (r[2] == local or r[3] == local)]
+            except Exception:
+                pass
+        except Exception:
+            pass
+
     def start_system(self):
         if self.is_running: return
         self.is_running = True
@@ -242,18 +448,47 @@ class HipsDashboard:
         self.btn_stop.config(state="normal")
         self.lbl_status.config(text="Status: SYSTEM ACTIVE - Logging to file", foreground="green")
 
-        self.sniffer = PacketCaptureThread(self.packet_queue)
-        
+        # Create detector first so we can share its blocked_ips with the sniffer.
         self.detector = DetectionEngine(
-            self.packet_queue, 
-            self.update_gui, 
-            self.blacklist_bst, 
-            self.alert_stack, 
-            self.network_graph
+            self.packet_queue,
+            self.update_gui,
+            self.blacklist_bst,
+            self.alert_stack,
+            self.network_graph,
+            analyze_local=self.analyze_local_var.get()
         )
-        
-        self.sniffer.start()
+
+        # Pass a reference to the detector's blocked_ips set so the sniffer can
+        # drop blocked packets before they reach the queue. Also pass lock.
+        self.sniffer = PacketCaptureThread(self.packet_queue, blocked_ips=self.detector.blocked_ips, blocked_lock=self.detector.blocked_lock)
+
+        # Start detector first so it is ready to consume packets.
         self.detector.start()
+        self.sniffer.start()
+
+    def toggle_analyze_local(self):
+        # Update detector setting if running; otherwise the value is used when starting.
+        val = self.analyze_local_var.get()
+        if self.detector:
+            self.detector.analyze_local = val
+        # Clear activity list when turning off
+        if not val:
+            self.activity_list.delete(0, tk.END)
+
+    def clear_activity(self):
+        try:
+            self.activity_list.delete(0, tk.END)
+        except Exception:
+            pass
+
+    def show_privacy_info(self):
+        message = (
+            "When 'Analyze Local Traffic' is enabled the system will inspect small payload snippets\n"
+            "from local inbound/outbound packets and display them in the Activity pane.\n\n"
+            "Privacy note: snippets may contain parts of URLs or request headers.\n"
+            "Do not enable this option on multi-user systems or when handling sensitive data."
+        )
+        messagebox.showinfo("Privacy Info", message)
 
     def stop_system(self):
         if not self.is_running: return
@@ -264,6 +499,60 @@ class HipsDashboard:
 
         if self.sniffer: self.sniffer.stop()
         if self.detector: self.detector.stop()
+
+    def manage_blocks(self):
+        if not self.detector:
+            messagebox.showwarning("Manage Blocks", "Start the system before managing blocks.")
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("Manage Blocked IPs")
+        win.geometry("400x300")
+
+        lb = tk.Listbox(win, font=('Consolas', 11))
+        lb.pack(fill='both', expand=True, padx=8, pady=8)
+
+        def refresh_list():
+            lb.delete(0, tk.END)
+            with self.detector.blocked_lock:
+                items = sorted(list(self.detector.blocked_ips))
+            for ip in items:
+                lb.insert(tk.END, ip)
+
+        def unblock_selected():
+            sel = lb.curselection()
+            if not sel:
+                messagebox.showwarning("Unblock", "Select an IP first.")
+                return
+            ip = lb.get(sel[0])
+            ok = FirewallManager.unblock_ip(ip)
+            if ok:
+                with self.detector.blocked_lock:
+                    if ip in self.detector.blocked_ips:
+                        self.detector.blocked_ips.remove(ip)
+                try:
+                    self.detector._save_persisted_blocks()
+                except Exception:
+                    pass
+                refresh_list()
+                # Remove alert entries that mention this IP
+                for i in range(self.alert_list.size()-1, -1, -1):
+                    try:
+                        if ip in self.alert_list.get(i):
+                            self.alert_list.delete(i)
+                    except Exception:
+                        pass
+                messagebox.showinfo("Unblock", f"IP {ip} unblocked.")
+            else:
+                messagebox.showerror("Unblock", f"Failed to unblock {ip}. Run as Administrator.")
+
+        btn_frame = tk.Frame(win)
+        btn_frame.pack(fill='x', padx=8, pady=(0,8))
+        ttk.Button(btn_frame, text="Refresh", command=refresh_list).pack(side='left', padx=4)
+        ttk.Button(btn_frame, text="Unblock Selected", command=unblock_selected).pack(side='left', padx=4)
+        ttk.Button(btn_frame, text="Close", command=win.destroy).pack(side='right', padx=4)
+
+        refresh_list()
 
 if __name__ == "__main__":
     try:
