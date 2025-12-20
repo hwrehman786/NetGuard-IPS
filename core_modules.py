@@ -4,6 +4,8 @@ import subprocess
 import socket
 import datetime
 import sys
+import json
+import os
 
 # Handle Scapy import gracefully
 try:
@@ -57,11 +59,14 @@ class Logger:
 
 class PacketCaptureThread(threading.Thread):
     """Packet Capture Module: Multithreaded Sniffer"""
-    def __init__(self, packet_queue):
+    def __init__(self, packet_queue, blocked_ips=None, blocked_lock=None):
         super().__init__()
         self.packet_queue = packet_queue
         self.stop_event = threading.Event()
         self.daemon = True
+        # Optional shared set of blocked IPs (DetectionEngine.blocked_ips)
+        self.blocked_ips = blocked_ips
+        self.blocked_lock = blocked_lock
 
     def run(self):
         print("[SNIFFER] Started...")
@@ -74,15 +79,31 @@ class PacketCaptureThread(threading.Thread):
 
     def process_packet(self, packet):
         # Feature 1: Extract packets. We accept IP and ARP.
+        # Drop packets from IPs that are already blocked (filter early).
+        if IP in packet:
+            try:
+                src_ip = packet[IP].src
+                if self.blocked_ips:
+                    if self.blocked_lock:
+                        with self.blocked_lock:
+                            if src_ip in self.blocked_ips:
+                                return
+                    else:
+                        if src_ip in self.blocked_ips:
+                            return
+            except Exception:
+                pass
+
         if IP in packet or ARP in packet:
             self.packet_queue.put(packet)
 
     def stop(self):
         self.stop_event.set()
 
+
 class DetectionEngine(threading.Thread):
     """Detection Engine: Signature Matching & Anomaly Detection"""
-    def __init__(self, packet_queue, gui_callback, blacklist_bst, alert_stack, network_graph):
+    def __init__(self, packet_queue, gui_callback, blacklist_bst, alert_stack, network_graph, analyze_local=False):
         super().__init__()
         self.packet_queue = packet_queue
         self.stop_event = threading.Event()
@@ -91,6 +112,8 @@ class DetectionEngine(threading.Thread):
         self.blacklist = blacklist_bst
         self.alert_stack = alert_stack
         self.network_graph = network_graph
+        # Whether to analyze local (self) traffic. When False, local_ip is treated as whitelisted.
+        self.analyze_local = analyze_local
         
         # Detection States
         self.packet_counts = {} 
@@ -114,6 +137,18 @@ class DetectionEngine(threading.Thread):
         self.PORT_SCAN_THRESHOLD = 5 # Port Scanning (Feature 2)
         self.SYN_THRESHOLD = 20 # SYN packets per second
         self.dns_cache = {}
+
+        # Thread-safety for blocked IPs
+        self.blocked_lock = threading.Lock()
+
+        # Persistence file for blocked IPs
+        self._blocked_store = os.path.join(os.path.dirname(__file__), "blocked_ips.json")
+
+        # Load persisted blocked IPs (if any) and attempt to re-apply OS blocks
+        try:
+            self._load_persisted_blocks()
+        except Exception as e:
+            print(f"[WARN] Could not load persisted blocks: {e}")
 
     def get_local_ip(self):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -205,12 +240,17 @@ class DetectionEngine(threading.Thread):
         # Whitelist Check
         if src_ip in self.whitelist:
             if src_ip == self.local_ip:
-                hostname = self.get_hostname(src_ip)
-                self.gui_callback("TRAFFIC", (src_ip, hostname, dst_ip, proto, length))
-            return
+                # If configured to analyze local traffic, allow normal analysis to continue.
+                if not self.analyze_local:
+                    hostname = self.get_hostname(src_ip)
+                    self.gui_callback("TRAFFIC", (src_ip, hostname, dst_ip, proto, length, sport, dport))
+                    return
+            else:
+                return
 
-        if src_ip in self.blocked_ips:
-            return
+        with self.blocked_lock:
+            if src_ip in self.blocked_ips:
+                return
 
         # Reset counters
         current_time = time.time()
@@ -234,6 +274,20 @@ class DetectionEngine(threading.Thread):
                     severity = "Medium"
             except:
                 pass
+
+        # If analyzing local traffic, also emit a LOCAL_ACTIVITY event with a small payload snippet
+        try:
+            if self.analyze_local and (src_ip == self.local_ip or dst_ip == self.local_ip) and Raw in pkt:
+                raw_bytes = pkt[Raw].load
+                try:
+                    raw_text = raw_bytes.decode('utf-8', errors='replace')
+                except Exception:
+                    raw_text = str(raw_bytes)
+                snippet = raw_text.replace('\r', ' ').split('\n')[0][:300]
+                direction = 'OUT' if src_ip == self.local_ip else 'IN'
+                self.gui_callback('LOCAL_ACTIVITY', (direction, src_ip, dst_ip, snippet))
+        except Exception:
+            pass
 
         # 2. SYN Flood Detection
         if TCP in pkt and pkt[TCP].flags == 'S': 
@@ -270,20 +324,77 @@ class DetectionEngine(threading.Thread):
             self.trigger_alert(src_ip, reason, severity)
         else:
             hostname = self.get_hostname(src_ip)
-            self.gui_callback("TRAFFIC", (src_ip, hostname, dst_ip, proto, length))
+            self.gui_callback("TRAFFIC", (src_ip, hostname, dst_ip, proto, length, sport, dport))
 
     def trigger_alert(self, src_ip, reason, severity):
-        success = FirewallManager.block_ip(src_ip)
-        if success:
+        # Immediately add to in-memory blocked list so subsequent packets
+        # are ignored without waiting for the OS firewall call to finish.
+        with self.blocked_lock:
             self.blocked_ips.add(src_ip)
-            hostname = self.get_hostname(src_ip)
-            
-            print(f"[ALERT] {severity.upper()}: {src_ip} - {reason}")
-            Logger.log_alert(src_ip, reason, severity)
-            
-            alert_msg = f"[{severity.upper()}] BLOCKED {src_ip} ({hostname}): {reason}"
-            self.alert_stack.push(alert_msg)
-            self.gui_callback("ALERT", (src_ip, hostname, reason, severity))
+        # Persist the updated blocked set immediately
+        try:
+            self._save_persisted_blocks()
+        except Exception as e:
+            print(f"[WARN] Could not persist blocked IPs: {e}")
+
+        hostname = self.get_hostname(src_ip)
+
+        print(f"[ALERT] {severity.upper()}: {src_ip} - {reason}")
+        Logger.log_alert(src_ip, reason, severity)
+
+        alert_msg = f"[{severity.upper()}] BLOCKED {src_ip} ({hostname}): {reason}"
+        self.alert_stack.push(alert_msg)
+        self.gui_callback("ALERT", (src_ip, hostname, reason, severity))
+
+        # Perform the OS-level firewall block asynchronously so we don't
+        # delay packet processing (netsh can be slow or require admin).
+        def _block_and_retry(ip, attempt=1, max_attempts=5):
+            try:
+                success = FirewallManager.block_ip(ip)
+                if not success and attempt < max_attempts:
+                    delay = [5, 15, 30, 60, 120][min(attempt-1, 4)]
+                    print(f"[WARN] Firewall block failed for {ip}, retrying in {delay}s (attempt {attempt + 1})")
+                    Logger.log_alert(ip, f"Firewall block failed, retrying in {delay}s (attempt {attempt + 1})", "Warning")
+                    t = threading.Timer(delay, _block_and_retry, args=(ip, attempt+1, max_attempts))
+                    t.daemon = True
+                    t.start()
+                elif not success:
+                    print(f"[ERROR] Firewall block ultimately failed for {ip} after {max_attempts} attempts")
+                    Logger.log_alert(ip, f"Firewall block ultimately failed after {max_attempts} attempts", "Error")
+            except Exception as e:
+                print(f"[ERROR] Blocking thread error for {ip}: {e}")
+                Logger.log_alert(ip, f"Blocking thread error: {e}", "Error")
+
+        t = threading.Thread(target=_block_and_retry, args=(src_ip,), daemon=True)
+        t.start()
+
+    def _save_persisted_blocks(self):
+        try:
+            with self.blocked_lock:
+                data = list(self.blocked_ips)
+            with open(self._blocked_store, 'w') as fh:
+                json.dump({'blocked': data}, fh)
+        except Exception as e:
+            print(f"[WARN] Failed to write blocked_ips file: {e}")
+            Logger.log_alert("local", f"Failed to write blocked_ips file: {e}", "Warning")
+
+    def _load_persisted_blocks(self):
+        if not os.path.isfile(self._blocked_store):
+            return
+        try:
+            with open(self._blocked_store, 'r') as fh:
+                j = json.load(fh)
+                items = j.get('blocked', [])
+                for ip in items:
+                    with self.blocked_lock:
+                        if ip not in self.blocked_ips:
+                            self.blocked_ips.add(ip)
+                            # Try to re-apply OS-level block asynchronously
+                            t = threading.Thread(target=FirewallManager.block_ip, args=(ip,), daemon=True)
+                            t.start()
+        except Exception as e:
+            print(f"[WARN] Failed to load blocked_ips file: {e}")
+            Logger.log_alert("local", f"Failed to load blocked_ips file: {e}", "Warning")
 
     def stop(self):
         self.stop_event.set()
