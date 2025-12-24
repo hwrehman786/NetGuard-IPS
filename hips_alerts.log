@@ -53,3 +53,4 @@
 [2025-12-15 12:28:43] [HIGH] IP: 45.155.205.10 - Signature Match: SQL Injection (Simulation)
 [2025-12-15 12:30:19] [HIGH] IP: 45.155.205.10 - Signature Match: SQL Injection (Simulation)
 [2025-12-15 12:31:11] [HIGH] IP: 45.155.205.10 - Signature Match: SQL Injection (Simulation)
+[2025-12-24 23:48:10] [WARNING] IP: local - Signature mismatch for blocked_ips.json — possible tampering
